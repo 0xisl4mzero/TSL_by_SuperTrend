@@ -1,0 +1,307 @@
+//+------------------------------------------------------------------+
+//|                                    SuperTrend_EA_With_TSL_v7.mq5 |
+//|                                     Copyright 2026, by - 0xisl4m |
+//+------------------------------------------------------------------+
+#property copyright "Author of Indicator : 0xisl4m"
+#property link      "@0xisl4m"
+#property version   "7.00"
+#property description "EA that executes on SuperTrend arrows filtered by EMA, with direct exit rules."
+
+//--- Includes
+#include <Trade\Trade.mqh> 
+
+// --- SECURITY SETTINGS ---
+long TargetAccount = 25336941;  
+
+//--- Includes
+CTrade            trade; 
+
+//+------------------------------------------------------------------+
+input group "=== Trade and Money Management ==="
+input double      FixedLot           = 0.01;      // Lot size is fixed
+input bool        entryOnSTNewsignal = true;      // Trade on fresh closed bar SuperTrend Arrow
+input bool        clossOnNewArrow    = true;      // Close open positions on opposite arrow signal
+
+//--- Input Group for Organization
+input group "=== SuperTrend Settings ==="   // This group for live chart indicator visual rendering
+input int                InpMagic             = 915100;
+input int                ATRPeriod            = 10;            
+input double             Multiplier           = 5.0;           
+input ENUM_APPLIED_PRICE SourcePrice          = PRICE_MEDIAN;  
+input bool               TakeWicksIntoAccount = false;         
+
+input group "=== TSL Settings ==="         // This group for independent timeframe TSL trailing rules
+input bool               TSLFilterOn          = false;         // If true, trail SL by backend SuperTrend line 
+input ENUM_TIMEFRAMES    TSLTimeframe         = PERIOD_M5;     // Timeframe for TSL calculation working
+input int                TSL_ATRPeriod        = 10;            
+input double             TSL_Multiplier       = 5.0;           
+input ENUM_APPLIED_PRICE TSL_SourcePrice      = PRICE_MEDIAN;  
+input bool               TSL_TakeWicksIntoAccount = false;  
+
+input group "=== Moving Average Filter ==="
+input bool               MAFilterOn      = true;         // Filter entries with Moving Average?
+input ENUM_TIMEFRAMES    MATimeframe     = PERIOD_M5;     // Timeframe for Moving Average Filter
+input double             PctPricefromMA  = 3.0;           // % Price can be away from MA to trigger extreme filter
+input int                MA_Period       = 200;           // Moving Average Period
+input ENUM_MA_METHOD     MA_Mode         = MODE_EMA;      // Moving Average Mode/Method
+input ENUM_APPLIED_PRICE MA_AppPrice     = PRICE_MEDIAN;  // Moving Avg Applied Price
+
+//+----------No trading time zone logic list --------------+
+input bool           NewsFilterOn    = true;         // Filter for Level 3 News?
+enum sep_dropdown{comma=0, semicolon=1};
+input sep_dropdown   separator       = 0;            // Separator to separate news keywords
+input string         KeyNews         = "BCB,NFP,JOLTS,Nonfarm,FOMC,PMI,PPI,CPI,Retail,GDP,Confidence,Interest Rate,Unemployment Rate"; 
+input string         NewsCurrencies  = "USD";        // Currencies for News Lookup
+input int            DaysNewsLookup  = 100;          // No of Days to look up news
+input int            StopBeforeMin   = 15;           // Stop Trading before (in minutes)
+input int            StartTradingMin = 15;           // Start Trading after (in minutes)
+
+//+----------others settings  --------------+
+input group "=== Alert and others Settings ==="
+input string TradeComment = "Gold trailing ";
+input bool               EnablePushAlert      = true;          // Send to Mobile App
+input bool               EnableDesktopAlert   = false;         // Show Popup on PC
+input color ChartColorTradingOff = clrMaroon; // Chart color when EA is Inactive
+input color ChartColorTradingOn = clrBlack; // Chart color when EA is active
+input bool           HideIndicators = false; // Hide Indicators on Chart?
+
+//--- Global Handles & Variable Declarations
+int      handleVisualIndicator = INVALID_HANDLE;
+int      handleTSLIndicator    = INVALID_HANDLE;
+int      handleMovAvg          = INVALID_HANDLE;
+datetime lastProcessedBarTime  = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // 1. Structural Security Validation Check
+   if(AccountInfoInteger(ACCOUNT_LOGIN) != TargetAccount)
+   {
+      Alert("UNAUTHORIZED");
+      return(INIT_FAILED);
+   }
+
+   // 2. Initialize Visual Chart Indicator Instance
+   handleVisualIndicator = iCustom(_Symbol, PERIOD_CURRENT, "SuperTrend_With_Arrow_Signal", 
+                                   ATRPeriod, Multiplier, SourcePrice, TakeWicksIntoAccount, 
+                                   EnablePushAlert, EnableDesktopAlert);
+                                   
+   if(handleVisualIndicator == INVALID_HANDLE)
+   {
+      Print("Failed to load visual SuperTrend indicator file.");
+      return(INIT_FAILED);
+   }
+
+   if(!ChartIndicatorAdd(0, 0, handleVisualIndicator))
+   {
+      Print("Error pushing indicators layer onto window. Code: ", GetLastError());
+   }
+
+   // 3. Initialize TSL Core Handle
+   handleTSLIndicator = iCustom(_Symbol, TSLTimeframe, "SuperTrend_With_Arrow_Signal", 
+                                TSL_ATRPeriod, TSL_Multiplier, TSL_SourcePrice, TSL_TakeWicksIntoAccount, 
+                                false, false); 
+
+   // 4. Initialize Moving Average Filter Handle
+   if(MAFilterOn)
+   {
+      handleMovAvg = iMA(_Symbol, MATimeframe, MA_Period, 0, MA_Mode, MA_AppPrice);
+      if(handleMovAvg == INVALID_HANDLE)
+      {
+         Print("Failed to build Moving Average handle.");
+         return(INIT_FAILED);
+      }
+   }
+
+   trade.SetExpertMagicNumber(InpMagic);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(handleVisualIndicator != INVALID_HANDLE) IndicatorRelease(handleVisualIndicator);
+   if(handleTSLIndicator != INVALID_HANDLE)    IndicatorRelease(handleTSLIndicator);
+   if(handleMovAvg != INVALID_HANDLE)          IndicatorRelease(handleMovAvg);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // TSL Engine execution
+   if(TSLFilterOn && handleTSLIndicator != INVALID_HANDLE)
+   {
+      RunTSLEngine();
+   }
+
+   // Execution Engine & Position Exit Rules Logic
+   RunExecutionEngine();
+}
+
+//+------------------------------------------------------------------+
+//| Order Entry & Opposite Signal Position Management Engine         |
+//+------------------------------------------------------------------+
+void RunExecutionEngine()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(currentBarTime == 0) return;
+   
+   // Work exclusively on confirmed freshly closed bar state changes
+   if(currentBarTime == lastProcessedBarTime) return;
+
+   double buyArrow[], sellArrow[], trendDir[];
+   ArraySetAsSeries(buyArrow, true);
+   ArraySetAsSeries(sellArrow, true);
+   ArraySetAsSeries(trendDir, true);
+
+   // Extract structural coordinates from confirmed closed bar index 1
+   if(CopyBuffer(handleVisualIndicator, 2, 1, 1, buyArrow) <= 0) return;
+   if(CopyBuffer(handleVisualIndicator, 3, 1, 1, sellArrow) <= 0) return;
+   if(CopyBuffer(handleVisualIndicator, 4, 1, 1, trendDir) <= 0) return;
+
+   bool signalBuy  = (buyArrow[0] != EMPTY_VALUE && buyArrow[0] > 0);
+   bool signalSell = (sellArrow[0] != EMPTY_VALUE && sellArrow[0] > 0);
+   int  currentDir = (int)trendDir[0];
+
+   // --- POSITION CLOSING CHECKS ---
+   if(clossOnNewArrow)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagic)
+            {
+               ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               
+               if(type == POSITION_TYPE_BUY && currentDir == -1)
+               {
+                  trade.PositionClose(PositionGetTicket(i));
+               }
+               else if(type == POSITION_TYPE_SELL && currentDir == 1)
+               {
+                  trade.PositionClose(PositionGetTicket(i));
+               }
+            }
+         }
+      }
+   }
+
+   // --- ORDER EXECUTIONS SYSTEM ---
+   if(entryOnSTNewsignal)
+   {
+      int openBuys = 0, openSells = 0;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagic)
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)  openBuys++;
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) openSells++;
+            }
+         }
+      }
+
+      // Check Moving Average filters before confirming market entry modifications
+      bool maBuyAllowed  = true;
+      bool maSellAllowed = true;
+
+      if(MAFilterOn && handleMovAvg != INVALID_HANDLE)
+      {
+         double maVal[];
+         ArraySetAsSeries(maVal, true);
+         if(CopyBuffer(handleMovAvg, 0, 1, 1, maVal) > 0)
+         {
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            
+            double highLimit = maVal[0] * (1.0 + (PctPricefromMA / 100.0));
+            double lowLimit  = maVal[0] * (1.0 - (PctPricefromMA / 100.0));
+
+            // Filtering limits: Price must align with trend direction up to the percentage boundary
+            if(ask < maVal[0] || ask > highLimit) maBuyAllowed = false;
+            if(bid > maVal[0] || bid < lowLimit)  maSellAllowed = false;
+         }
+      }
+
+      // Fire Trades
+      if(signalBuy && openBuys == 0 && maBuyAllowed)
+      {
+         trade.Buy(FixedLot, _Symbol, 0, 0, 0, TradeComment);
+         lastProcessedBarTime = currentBarTime;
+      }
+      else if(signalSell && openSells == 0 && maSellAllowed)
+      {
+         trade.Sell(FixedLot, _Symbol, 0, 0, 0, TradeComment);
+         lastProcessedBarTime = currentBarTime;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Multi-timeframe Trailing Stop Loss Management Engine             |
+//+------------------------------------------------------------------+
+void RunTSLEngine()
+{
+   if(handleTSLIndicator == INVALID_HANDLE) return;
+
+   double stLineBuffer[];
+   double trendDirBuffer[];
+   ArraySetAsSeries(stLineBuffer, true);
+   ArraySetAsSeries(trendDirBuffer, true);
+   
+   if(CopyBuffer(handleTSLIndicator, 0, 1, 1, stLineBuffer) <= 0) return;
+   if(CopyBuffer(handleTSLIndicator, 4, 1, 1, trendDirBuffer) <= 0) return;
+   
+   if(stLineBuffer[0] == EMPTY_VALUE || stLineBuffer[0] <= 0) return;
+   
+   double targetSLValue    = NormalizeDouble(stLineBuffer[0], _Digits);
+   int    currentDirection = (int)trendDirBuffer[0];
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         
+         if(posMagic == 0 || posMagic == InpMagic)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               double currentSL = PositionGetDouble(POSITION_SL);
+               double currentTP = PositionGetDouble(POSITION_TP);
+               ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+               if(type == POSITION_TYPE_BUY && currentDirection == 1)
+               {
+                  if(targetSLValue > currentSL || currentSL == 0)
+                  {
+                     if(targetSLValue < SymbolInfoDouble(_Symbol, SYMBOL_BID))
+                     {
+                        trade.PositionModify(ticket, targetSLValue, currentTP);
+                     }
+                  }
+               }
+               else if(type == POSITION_TYPE_SELL && currentDirection == -1)
+               {
+                  if(targetSLValue < currentSL || currentSL == 0)
+                  {
+                     if(targetSLValue > SymbolInfoDouble(_Symbol, SYMBOL_ASK))
+                     {
+                        trade.PositionModify(ticket, targetSLValue, currentTP);
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+}
