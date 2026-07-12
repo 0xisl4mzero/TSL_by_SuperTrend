@@ -134,6 +134,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   ChartSetInteger(0, CHART_SHOW_GRID, false);
    // TSL Engine execution
    if(TSLFilterOn && handleTSLIndicator != INVALID_HANDLE)
    {
